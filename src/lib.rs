@@ -16,7 +16,7 @@
 use rusty_engine::prelude::*;
 use rand::prelude::*;
 use std::collections::VecDeque;
-use core::f32::consts::*;
+use std::collections::HashMap;
 
 const MAX_NR_PLAYERS: usize = 4;
 
@@ -139,39 +139,17 @@ impl Player {
     }
 }
 
-#[derive(Debug, Clone)]
-struct Obstacle {
+struct Object {
     label: String,
-    speed: Vec2, /* Virtual pixels in x and y per move */
+    pos: Vec2,
+    speed: Vec2,
+    scale: f32,
 }
 
-impl Obstacle {
-    const MIN_SCALE: f32 = 0.2;
-    const MAX_SCALE: f32 = 1.2;
-
-    fn new(engine: &mut Engine, idx: usize) -> Obstacle{
-        let x = engine.window_dimensions.x / 2.0;
-        let y = engine.window_dimensions.y / 2.0;
-        let scale = thread_rng().gen_range(Obstacle::MIN_SCALE..Obstacle::MAX_SCALE);
-        let obstacle = Obstacle {
-            label: format!("obstacle{}", idx),
-            speed: Vec2 {
-                x: thread_rng().gen_range(-(2.0/scale)..(2.0/scale)),
-                y: thread_rng().gen_range(-(2.0/scale)..(2.0/scale)),
-            },
-        };
-
-        println!("Obstacle::new() -> {:?}", obstacle);
-        let obstacle_sprite = engine.add_sprite(obstacle.label.clone(), SpritePreset::RacingBarrelRed);
-        obstacle_sprite.translation = Vec2{x: thread_rng().gen_range((-x + 20.0)..(x - 20.0)), y: thread_rng().gen_range((-y + 20.0)..(y - 20.0))};
-        obstacle_sprite.collision = true;
-        obstacle_sprite.scale = scale;
-        obstacle
-    }
-
-    fn bounce(self: &mut Obstacle, other: &mut Obstacle, self_sprite: &Sprite, other_sprite: &Sprite) {
-        let x = self_sprite.translation.x - other_sprite.translation.x;
-        let y = self_sprite.translation.y - other_sprite.translation.y;
+impl Object {
+    fn bounce(self: &mut Self, other: &mut Self) {
+        let x = self.pos.x - other.pos.x;
+        let y = self.pos.y - other.pos.y;
         let d = x * x + y * y;
 
         let u1 = (self.speed.x * x + self.speed.y * y) / d;
@@ -179,9 +157,9 @@ impl Obstacle {
         let u3 = (other.speed.x * x + other.speed.y * y) / d;
         let u4 = (x * other.speed.y - y * other.speed.x) / d;
 
-        let mm = self_sprite.scale + other_sprite.scale;
-        let vu3 = (self_sprite.scale - other_sprite.scale) / mm * u1 + (2.0 * other_sprite.scale) / mm * u3;
-        let vu1 = (other_sprite.scale - self_sprite.scale) / mm * u3 + (2.0 * self_sprite.scale) / mm * u1;
+        let mm = self.scale + other.scale;
+        let vu3 = (self.scale - other.scale) / mm * u1 + (2.0 * other.scale) / mm * u3;
+        let vu1 = (other.scale - self.scale) / mm * u3 + (2.0 * self.scale) / mm * u1;
 
         other.speed.x = x * vu1 - y * u4;
         other.speed.y = y * vu1 + x * u4;
@@ -189,27 +167,22 @@ impl Obstacle {
         self.speed.y = y * vu3 + x * u2;
     }
 
-    fn do_move(self: &mut Self, engine: &mut Engine) {
-        let max_x = engine.window_dimensions.x / 2.0;
-        let max_y = engine.window_dimensions.y / 2.0;
-        let self_sprite = engine.sprites.get_mut(&self.label).unwrap();
-        let mut new_pos = Vec2 {
-            x: self_sprite.translation.x + self.speed.x,
-            y: self_sprite.translation.y + self.speed.y,
-        };
-        if new_pos.x > max_x {
-            new_pos.x = -max_x;
+    fn do_move(self: &mut Self, pos_max: Vec2) {
+        self.pos.x += self.speed.x;
+        self.pos.y += self.speed.y;
+
+        if self.pos.x > pos_max.x {
+            self.pos.x = -pos_max.x;
         }
-        if new_pos.x < -max_x {
-            new_pos.x = max_x;
+        if self.pos.x < -pos_max.x {
+            self.pos.x = pos_max.x;
         }
-        if new_pos.y > max_y {
-            new_pos.y = -max_y;
+        if self.pos.y > pos_max.y {
+            self.pos.y = -pos_max.y;
         }
-        if new_pos.y < -max_y {
-            new_pos.y = max_y;
+        if self.pos.y < -pos_max.y {
+            self.pos.y = pos_max.y;
         }
-        self_sprite.translation = new_pos;
     }
 }
 
@@ -217,28 +190,28 @@ const OBSTACLE_MOVE_INTERVAL: f32 = 0.1;
 const OBSTACLE_SPAWN_INTERVAL: f32 = 6.0;
 
 struct GameState {
+    pos_max: Vec2,
+
     /* Some initialization must be done first call to game logic */
     first_iteration: bool,
 
     /* Moving obstacles */
-    obstacles: Vec<Obstacle>,
+    objects: HashMap<String, Object>,
 
-    obstacle_serial: usize,
+    object_serial: usize,
 
     /* When it's time to add one more obstacle */
-    obstacle_next_timer: Timer,
+    obstacle_spawn_timer: Timer,
 
     /* Interval when to move obstacles */
     obstacle_move_timer: Timer,
 
+    /* When to add a pill */
+    pill_spawn_timer: Timer,
+
+
     /* When it's time for a player snake to move */
     player_move_timer: Timer,
-
-    /* When to add a pill */
-    pill_timer: Timer,
-
-    /* Nr of pills added, to create unique pill names */
-    pill_idx: usize,
 
     /* Players */
     player: [Player; MAX_NR_PLAYERS],
@@ -247,14 +220,14 @@ struct GameState {
 impl Default for GameState {
     fn default() -> Self {
         GameState {
+            pos_max: Vec2 {x: 0.0, y: 0.0},
             first_iteration: true,
-            obstacles: Vec::new(),
-            obstacle_serial: 0,
-            obstacle_next_timer: Timer::from_seconds(OBSTACLE_SPAWN_INTERVAL, true),
+            objects: HashMap::new(),
+            object_serial: 0,
+            obstacle_spawn_timer: Timer::from_seconds(OBSTACLE_SPAWN_INTERVAL, true),
             obstacle_move_timer: Timer::from_seconds(OBSTACLE_MOVE_INTERVAL, true),
-            player_move_timer: Timer::from_seconds(PLAYER_MOVE_TIMER_START, false),
-            pill_timer: Timer::from_seconds(PILL_SPAWN_INTERVAL, true),
-            pill_idx: 0,
+            player_move_timer: Timer::from_seconds(PLAYER_MOVE_TIMER_START, true),
+            pill_spawn_timer: Timer::from_seconds(PILL_SPAWN_INTERVAL, true),
             player: [
                 Player::new(0),
                 Player::new(1),
@@ -262,6 +235,75 @@ impl Default for GameState {
                 Player::new(3),
             ],
         }
+    }
+}
+
+impl GameState {
+    fn add_obstacle(self: &mut GameState, engine: &mut Engine) {
+        /* Minimum scale, also used as mass */
+        const MIN_SCALE: f32 = 0.2;
+
+        /* Maximum scale, also used as mass */
+        const MAX_SCALE: f32 = 1.2;
+
+        /* Speed for scale 1.0 in virtual pixels per move */
+        const MAX_BASE_SPEED: f32 = 2.5;
+
+        let scale = thread_rng().gen_range(MIN_SCALE..MAX_SCALE);
+        let obstacle = Object {
+            label: format!("object-obstacle{}", self.object_serial),
+            pos: Vec2 {
+                x: 0.0,
+                y: 0.0,
+            },
+            speed: Vec2 {
+                x: thread_rng().gen_range(-(MAX_BASE_SPEED/scale)..(MAX_BASE_SPEED/scale)),
+                y: thread_rng().gen_range(-(MAX_BASE_SPEED/scale)..(MAX_BASE_SPEED/scale)),
+            },
+            scale,
+        };
+        self.object_serial += 1;
+        let obstacle_sprite = engine.add_sprite(obstacle.label.clone(), SpritePreset::RacingBarrelRed);
+        obstacle_sprite.translation = obstacle.pos;
+        obstacle_sprite.scale = obstacle.scale;
+        obstacle_sprite.collision = true;
+        self.objects.insert(obstacle.label.clone(), obstacle);
+    }
+
+    fn add_pill(self: &mut GameState, engine: &mut Engine) {
+        const MIN_SCALE: f32 = 0.2;
+        const MAX_SCALE: f32 = 1.2;
+        let pill = Object {
+            label: format!("object-pill{}", self.object_serial),
+            pos: Vec2 {
+                x: thread_rng().gen_range(-(self.pos_max.x+20.0)..(self.pos_max.x-20.0)),
+                y: thread_rng().gen_range(-(self.pos_max.y+20.0)..(self.pos_max.y-20.0)),
+            },
+            speed: Vec2 {
+                x: 0.0,
+                y: 0.0,
+            },
+            scale: thread_rng().gen_range(MIN_SCALE..MAX_SCALE),
+        };
+        self.object_serial += 1;
+        let pill_sprite = engine.add_sprite(pill.label.clone(), SpritePreset::RacingBarrelBlue);
+        pill_sprite.translation = pill.pos;
+        pill_sprite.scale = pill.scale;
+        pill_sprite.collision = true;
+        self.objects.insert(pill.label.clone(), pill);
+    }
+
+    fn move_object(self: &mut GameState, engine: &mut Engine, object: &mut Object)
+    {
+        let object_sprite = engine.sprites.get_mut(&object.label).unwrap();
+        object.do_move(self.pos_max);
+        object_sprite.translation = object.pos;
+    }
+
+    fn object_collision(self: &mut GameState, objects: &CollisionPair) {
+        let object1 = self.objects.get_mut(&objects.0).unwrap();
+        let object2 = self.objects.get_mut(&objects.1).unwrap();
+        object1.bounce(object2);
     }
 }
 
@@ -316,47 +358,32 @@ fn new_position(engine: &Engine, pos: Vec2, dir: Direction, speed: f32) -> Vec2 
 
 fn game_logic(engine: &mut Engine, state: &mut GameState) {
     if state.first_iteration {
-        let nr_obstacles = 3;
-
-        println!("Nr obstacles: {}", nr_obstacles);
-
-        for _ in 0..nr_obstacles {
-        }
-
+        state.pos_max = Vec2 {
+            x: engine.window_dimensions.x / 2.0,
+            y: engine.window_dimensions.y / 2.0,
+        };
         state.first_iteration = false;
     }
 
-    let x = engine.window_dimensions.x / 2.0;
-    let y = engine.window_dimensions.y / 2.0;
-
     if state.obstacle_move_timer.tick(engine.delta).just_finished() {
-        for obstacle in state.obstacles.iter_mut() {
-            obstacle.do_move(engine);
+        for object in state.objects.iter_mut() {
+            object.1.do_move(state.pos_max);
         }
     }
 
-    if state.obstacle_next_timer.tick(engine.delta).just_finished() {
-        state.obstacle_next_timer = Timer::from_seconds(thread_rng().gen_range(2.0..10.0), false);
-        state.obstacles.push(Obstacle::new(engine, state.obstacle_serial));
-        state.obstacle_serial += 1;
+    if state.obstacle_spawn_timer.tick(engine.delta).just_finished() {
+        state.add_obstacle(engine);
     }
 
     // Check if it's time to add a pill
-    if state.pill_timer.tick(engine.delta).just_finished() {
-        let label = format!("pill{}", state.pill_idx);
-        state.pill_idx += 1;
-
-        let pill = engine.add_sprite(label, SpritePreset::RacingBarrelBlue);
-        pill.translation.x = thread_rng().gen_range(-(x+20.0)..(x-20.0));
-        pill.translation.y = thread_rng().gen_range(-(y+20.0)..(y-20.0));
-        pill.collision = true;
+    if state.pill_spawn_timer.tick(engine.delta).just_finished() {
+        state.add_pill(engine);
     }
 
     // Check if it's time for players to move
     if state.player_move_timer.tick(engine.delta).just_finished() {
-        state.player_move_timer = Timer::from_seconds(PLAYER_MOVE_TIMER_START, false);
 
-        for (idx, player) in state.player.iter_mut().enumerate() {
+        for player in state.player.iter_mut() {
             if ! player.is_playing() {
                 continue;
             }
@@ -366,7 +393,7 @@ fn game_logic(engine: &mut Engine, state: &mut GameState) {
             let head_sprite = engine.sprites.get_mut(&player.head_label).unwrap();
             head_sprite.translation = head_new_pos;
 
-            let tail_label = format!("player-tail{}.{}", idx, player.serial);
+            let tail_label = format!("player-tail{}.{}", player.idx, player.serial);
             player.serial += 1;
             let add_tail = engine.add_sprite(tail_label.clone(), player.sprite);
             add_tail.translation = head_old_pos;
@@ -402,7 +429,7 @@ fn game_logic(engine: &mut Engine, state: &mut GameState) {
 
         if player.loose_timeout.tick(engine.delta).just_finished() {
             let player_text = engine.add_text(player.score_label.clone(), format!("Player {}: {} points", player.idx, player.labels.len() * 10));
-            player_text.translation = Vec2::new(-x + 100.0 + (player.idx as f32 * 100.0), y - 50.0);
+            player_text.translation = Vec2::new(-state.pos_max.x + 100.0 + (player.idx as f32 * 100.0), state.pos_max.y - 50.0);
             player_text.scale = 0.4;
             engine.sprites.remove(&player.head_label);
             for label in &player.labels {
@@ -435,7 +462,7 @@ fn game_logic(engine: &mut Engine, state: &mut GameState) {
             let player = &mut state.player[(player_label.strip_prefix("player-head").unwrap().chars().nth(0).unwrap() as u8 - '0' as u8) as usize];
 
             // If pill, then eat it, otherwise loose
-            if colliding_with_label.starts_with("pill") {
+            if colliding_with_label.starts_with("object-pill") {
                 player.max_len += 1;
                 engine.sprites.remove(&colliding_with_label);
                 engine.audio_manager.play_sfx(SfxPreset::Confirmation1, 0.2);
@@ -444,23 +471,8 @@ fn game_logic(engine: &mut Engine, state: &mut GameState) {
                 engine.audio_manager.play_sfx(SfxPreset::Impact1, 0.2);
                 println!("{} lost", player_label);
             }
-        } else if event.pair.0.starts_with("obstacle") && event.pair.1.starts_with("obstacle") {
-            let mut obstacle1: Option<&mut Obstacle> = Option::None;
-            let mut obstacle2: Option<&mut Obstacle> = Option::None;
-            for obstacle in state.obstacles.iter_mut() {
-                if obstacle.label == event.pair.0 {
-                    obstacle1 = Some(obstacle);
-                } else if obstacle.label == event.pair.1 {
-                    obstacle2 = Some(obstacle);
-                }
-            }
-            if obstacle1.is_some() && obstacle2.is_some() {
-                let this = obstacle1.unwrap();
-                let other = obstacle2.unwrap();
-                let this_sprite = engine.sprites.get(&this.label).unwrap();
-                let other_sprite = engine.sprites.get(&other.label).unwrap();
-                this.bounce(other, this_sprite, other_sprite);
-            }
+        } else if event.pair.0.starts_with("object") && event.pair.1.starts_with("object") {
+            state.object_collision(&event.pair);
         }
     }
 }
