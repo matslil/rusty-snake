@@ -1,8 +1,61 @@
+/*
+ * Rewrite state.player to be an array instead.
+ * Player could have a default, which makes it empty.
+ * Make a function that can take &mut to a player and initialize it.
+ * Use that when creating a new player.
+ * Transform "loose" to a state which can be one of:
+ * - WAITING
+ * - PLAYING
+ * - LOST
+ *
+ * Player score text label should be store in player struct.
+ *
+ * Finish implementation of new_position_rad().
+ */
+
 use rusty_engine::prelude::*;
 use rand::prelude::*;
 use std::collections::VecDeque;
+use core::f32::consts::*;
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+const MAX_NR_PLAYERS: usize = 4;
+
+/* For each player, what key is used for turn left and turn right */
+const PLAYER_CONTROL: [[KeyCode; 2]; MAX_NR_PLAYERS] = [
+    /*  Left         Right   */
+    [KeyCode::Q, KeyCode::W], /* Player 0 */
+    [KeyCode::F, KeyCode::G], /* Player 1 */
+    [KeyCode::U, KeyCode::I], /* Player 2 */
+    [KeyCode::K, KeyCode::L], /* Player 3 */
+];
+
+const PLAYER_SPRITE_PRESETS: [SpritePreset; MAX_NR_PLAYERS] = [
+    SpritePreset::RollingBallBlueAlt,
+    SpritePreset::RollingBallBlue,
+    SpritePreset::RollingBallRedAlt,
+    SpritePreset::RollingBallRed
+];
+
+/* Starting move speed for a new player, in seconds per move */
+const PLAYER_MOVE_TIMER_START: f32 = 0.1;
+
+/* Size of player tail */
+const PLAYER_SCALE_TAIL: f32 = 0.2;
+
+/* Size of player head */
+const PLAYER_SCALE_HEAD: f32 = 0.3;
+
+/* How many seconds to freeze a player when player lost, after freeze player will be removed */
+const PLAYER_LOOSE_TIMEOUT: f32 = 5.0;
+
+/* How many virtual pixels to move player each time */
+const PLAYER_MOVE_DISTANCE: f32 = 10.0;
+
+const PLAYER_STARTING_MAX_LEN: usize = 4;
+
+const PILL_SPAWN_INTERVAL: f32 = 3.0;
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
 enum Direction {
     UP,
     RIGHT,
@@ -10,81 +63,204 @@ enum Direction {
     LEFT,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum PlayerState {
+    WAITING,
+    PLAYING,
+    LOST,
+}
+
 struct Player {
+    /* Static for each instance */
+    idx: usize,
     sprite: SpritePreset,
+    head_label: String,
+    score_label: String,
+    control: Vec<KeyCode>,
+    starting_direction: Direction,
+    starting_position: Vec2,
+
+    /* Variable */
     labels: VecDeque<String>,
     max_len: usize,
     serial: usize,
     direction: Direction,
-    head_pos: Vec2,
-    control: Vec<KeyCode>,
-    loose: bool,
+    state: PlayerState,
+    loose_timeout: Timer,
 }
-
-const PLAYER_CONTROL: [[KeyCode; 2];4] = [
-    [KeyCode::Q, KeyCode::W],
-    [KeyCode::F, KeyCode::G],
-    [KeyCode::U, KeyCode::I],
-    [KeyCode::K, KeyCode::L],
-];
 
 impl Player {
     fn new(instance: usize) -> Self {
-        const SPRITE_PRESETS: [SpritePreset; 4] = [
-            SpritePreset::RollingBallBlueAlt,
-            SpritePreset::RollingBallBlue,
-            SpritePreset::RollingBallRedAlt,
-            SpritePreset::RollingBallRed
-        ];
-        let player_label = format!("player{}.0", instance);
-        let mut player = Player {
-            sprite: SPRITE_PRESETS[instance],
-            labels: VecDeque::new(),
-            max_len: 4,
-            serial: 1,
-            direction: Direction::RIGHT,
-            head_pos: Vec2 { x: instance as f32 * 20.0, y: 0.0 },
+        Player {
+            idx: instance,
+            sprite: PLAYER_SPRITE_PRESETS[instance],
+            head_label: format!("player-head{}", instance),
+            score_label: format!("player-score{}", instance),
             control: PLAYER_CONTROL[instance].into(),
-            loose: false,
-        };
-        player.labels.push_front(player_label);
-        player
+            starting_direction: Direction::RIGHT,
+            starting_position: Vec2 { x: instance as f32 * 50.0, y: instance as f32 * 50.0 },
+            labels: VecDeque::new(),
+            max_len: PLAYER_STARTING_MAX_LEN,
+            serial: 0,
+            direction: Direction::RIGHT,
+            state: PlayerState::WAITING,
+            loose_timeout: Timer::from_seconds(PLAYER_LOOSE_TIMEOUT, false),
+        }
+    }
+
+    fn lost(self: &mut Self) {
+        self.state = PlayerState::LOST;
+    }
+
+    fn is_playing(self: &Self) -> bool {
+        self.state == PlayerState::PLAYING
+    }
+
+    fn is_waiting(self: &Self) -> bool {
+        self.state == PlayerState::WAITING
+    }
+
+    fn has_lost(self: &Self) -> bool {
+        self.state == PlayerState::LOST
+    }
+
+    /* Make player into same state as when new() was run */
+    fn deactivate(self: &mut Self) {
+        self.labels.truncate(0);
+        self.max_len = PLAYER_STARTING_MAX_LEN;
+        self.serial = 0;
+        self.direction = self.starting_direction;
+        self.state = PlayerState::WAITING;
+        self.loose_timeout = Timer::from_seconds(PLAYER_LOOSE_TIMEOUT, false);
+    }
+
+    fn activate(self: &mut Self) {
+        self.state = PlayerState::PLAYING;
     }
 }
 
-struct GameState {
-    obstacle_labels: VecDeque<String>,
-    obstacle_idx: u32,
-    obstacle_nr: u32,
-    obstacle_max: u32,
-    spawn_timer: Timer,
-    speed_timer: Timer,
-    player_move_timer: Timer,
-    pill_timer: Timer,
-    pill_idx: usize,
-    speed: u32,
-    player: Vec<Player>,
+#[derive(Debug, Clone)]
+struct Obstacle {
+    label: String,
+    speed: Vec2, /* Virtual pixels in x and y per move */
 }
 
-const PLAYER_MOVE_TIMER_START: f32 = 0.3;
+impl Obstacle {
+    const MIN_SCALE: f32 = 0.2;
+    const MAX_SCALE: f32 = 1.2;
 
-const PLAYER_SCALE_TAIL: f32 = 0.2;
-const PLAYER_SCALE_HEAD: f32 = 0.3;
+    fn new(engine: &mut Engine, idx: usize) -> Obstacle{
+        let x = engine.window_dimensions.x / 2.0;
+        let y = engine.window_dimensions.y / 2.0;
+        let scale = thread_rng().gen_range(Obstacle::MIN_SCALE..Obstacle::MAX_SCALE);
+        let obstacle = Obstacle {
+            label: format!("obstacle{}", idx),
+            speed: Vec2 {
+                x: thread_rng().gen_range(-(2.0/scale)..(2.0/scale)),
+                y: thread_rng().gen_range(-(2.0/scale)..(2.0/scale)),
+            },
+        };
+
+        println!("Obstacle::new() -> {:?}", obstacle);
+        let obstacle_sprite = engine.add_sprite(obstacle.label.clone(), SpritePreset::RacingBarrelRed);
+        obstacle_sprite.translation = Vec2{x: thread_rng().gen_range((-x + 20.0)..(x - 20.0)), y: thread_rng().gen_range((-y + 20.0)..(y - 20.0))};
+        obstacle_sprite.collision = true;
+        obstacle_sprite.scale = scale;
+        obstacle
+    }
+
+    fn bounce(self: &mut Obstacle, other: &mut Obstacle, self_sprite: &Sprite, other_sprite: &Sprite) {
+        let x = self_sprite.translation.x - other_sprite.translation.x;
+        let y = self_sprite.translation.y - other_sprite.translation.y;
+        let d = x * x + y * y;
+
+        let u1 = (self.speed.x * x + self.speed.y * y) / d;
+        let u2 = (x * self.speed.y - y * self.speed.x) / d;
+        let u3 = (other.speed.x * x + other.speed.y * y) / d;
+        let u4 = (x * other.speed.y - y * other.speed.x) / d;
+
+        let mm = self_sprite.scale + other_sprite.scale;
+        let vu3 = (self_sprite.scale - other_sprite.scale) / mm * u1 + (2.0 * other_sprite.scale) / mm * u3;
+        let vu1 = (other_sprite.scale - self_sprite.scale) / mm * u3 + (2.0 * self_sprite.scale) / mm * u1;
+
+        other.speed.x = x * vu1 - y * u4;
+        other.speed.y = y * vu1 + x * u4;
+        self.speed.x = x * vu3 - y * u2;
+        self.speed.y = y * vu3 + x * u2;
+    }
+
+    fn do_move(self: &mut Self, engine: &mut Engine) {
+        let max_x = engine.window_dimensions.x / 2.0;
+        let max_y = engine.window_dimensions.y / 2.0;
+        let self_sprite = engine.sprites.get_mut(&self.label).unwrap();
+        let mut new_pos = Vec2 {
+            x: self_sprite.translation.x + self.speed.x,
+            y: self_sprite.translation.y + self.speed.y,
+        };
+        if new_pos.x > max_x {
+            new_pos.x = -max_x;
+        }
+        if new_pos.x < -max_x {
+            new_pos.x = max_x;
+        }
+        if new_pos.y > max_y {
+            new_pos.y = -max_y;
+        }
+        if new_pos.y < -max_y {
+            new_pos.y = max_y;
+        }
+        self_sprite.translation = new_pos;
+    }
+}
+
+const OBSTACLE_MOVE_INTERVAL: f32 = 0.1;
+const OBSTACLE_SPAWN_INTERVAL: f32 = 6.0;
+
+struct GameState {
+    /* Some initialization must be done first call to game logic */
+    first_iteration: bool,
+
+    /* Moving obstacles */
+    obstacles: Vec<Obstacle>,
+
+    obstacle_serial: usize,
+
+    /* When it's time to add one more obstacle */
+    obstacle_next_timer: Timer,
+
+    /* Interval when to move obstacles */
+    obstacle_move_timer: Timer,
+
+    /* When it's time for a player snake to move */
+    player_move_timer: Timer,
+
+    /* When to add a pill */
+    pill_timer: Timer,
+
+    /* Nr of pills added, to create unique pill names */
+    pill_idx: usize,
+
+    /* Players */
+    player: [Player; MAX_NR_PLAYERS],
+}
 
 impl Default for GameState {
     fn default() -> Self {
         GameState {
-            spawn_timer: Timer::from_seconds(5.0, false),
-            speed_timer: Timer::from_seconds(10.0, true),
+            first_iteration: true,
+            obstacles: Vec::new(),
+            obstacle_serial: 0,
+            obstacle_next_timer: Timer::from_seconds(OBSTACLE_SPAWN_INTERVAL, true),
+            obstacle_move_timer: Timer::from_seconds(OBSTACLE_MOVE_INTERVAL, true),
             player_move_timer: Timer::from_seconds(PLAYER_MOVE_TIMER_START, false),
-            pill_timer: Timer::from_seconds(1.0, false),
+            pill_timer: Timer::from_seconds(PILL_SPAWN_INTERVAL, true),
             pill_idx: 0,
-            obstacle_labels: VecDeque::new(),
-            obstacle_idx: 0,
-            obstacle_nr: 0,
-            obstacle_max: 5,
-            speed: 1,
-            player: Vec::new(),
+            player: [
+                Player::new(0),
+                Player::new(1),
+                Player::new(2),
+                Player::new(3),
+            ],
         }
     }
 }
@@ -105,12 +281,6 @@ pub fn start_game() {
     game.run(state);
 }
 
-fn speed_to_spawn_timeout(initial: f32, speed: u32) -> f32 {
-    let lower = initial / speed as f32;
-    let higher = initial * 2.0 / speed as f32;
-    thread_rng().gen_range(lower..higher)
-}
-
 fn new_direction(curr_dir: Direction, turn_left: bool) -> Direction {
     match curr_dir {
         Direction::UP    => if turn_left { Direction::LEFT } else { Direction::RIGHT },
@@ -120,57 +290,59 @@ fn new_direction(curr_dir: Direction, turn_left: bool) -> Direction {
     }
 }
 
-fn new_position(engine: &Engine, pos: Vec2, dir: Direction) -> Vec2 {
-    const DISTANCE: f32 = 10.0;
-    let mut pos = match dir {
-        Direction::UP    => Vec2 { x: pos.x,            y: pos.y + DISTANCE },
-        Direction::RIGHT => Vec2 { x: pos.x + DISTANCE, y: pos.y },
-        Direction::DOWN  => Vec2 { x: pos.x,            y: pos.y - DISTANCE },
-        Direction::LEFT  => Vec2 { x: pos.x - DISTANCE, y: pos.y },
+fn new_position(engine: &Engine, pos: Vec2, dir: Direction, speed: f32) -> Vec2 {
+    let mut new_pos = match dir {
+        Direction::UP    => Vec2 { x: pos.x,            y: pos.y + speed },
+        Direction::RIGHT => Vec2 { x: pos.x + speed, y: pos.y },
+        Direction::DOWN  => Vec2 { x: pos.x,            y: pos.y - speed },
+        Direction::LEFT  => Vec2 { x: pos.x - speed, y: pos.y },
     };
     let max_x = engine.window_dimensions.x / 2.0;
     let max_y = engine.window_dimensions.y / 2.0;
-    if pos.x > max_x {
-        pos.x = -max_x;
+    if new_pos.x > max_x {
+        new_pos.x = -max_x;
     }
-    if pos.x < -max_x {
-        pos.x = max_x;
+    if new_pos.x < -max_x {
+        new_pos.x = max_x;
     }
-    if pos.y > max_y {
-        pos.y = -max_y;
+    if new_pos.y > max_y {
+        new_pos.y = -max_y;
     }
-    if pos.y < -max_y {
-        pos.y = max_y;
+    if new_pos.y < -max_y {
+        new_pos.y = max_y;
     }
-    pos
+    new_pos
 }
 
 fn game_logic(engine: &mut Engine, state: &mut GameState) {
-    if state.speed_timer.tick(engine.delta).just_finished() {
-        state.speed += 1;
+    if state.first_iteration {
+        let nr_obstacles = 3;
+
+        println!("Nr obstacles: {}", nr_obstacles);
+
+        for _ in 0..nr_obstacles {
+        }
+
+        state.first_iteration = false;
     }
+
     let x = engine.window_dimensions.x / 2.0;
     let y = engine.window_dimensions.y / 2.0;
-    if state.spawn_timer.tick(engine.delta).just_finished() {
-        state.spawn_timer = Timer::from_seconds(speed_to_spawn_timeout(3.0, state.speed), false);
 
-        let label = format!("obstacle{}", state.obstacle_idx);
-        state.obstacle_idx += 1;
-        let obstacle = engine.add_sprite(label.clone(), SpritePreset::RacingBarrelRed);
-        state.obstacle_labels.push_front(label);
-        obstacle.translation.x = thread_rng().gen_range(-(x+20.0)..(x-20.0));
-        obstacle.translation.y = thread_rng().gen_range(-(y+20.0)..(y-20.0));
-        obstacle.collision = true;
-        state.obstacle_nr += 1;
-        if state.obstacle_nr > state.obstacle_max {
-            engine.sprites.remove(&state.obstacle_labels.pop_back().unwrap());
-            state.obstacle_nr -= 1;
+    if state.obstacle_move_timer.tick(engine.delta).just_finished() {
+        for obstacle in state.obstacles.iter_mut() {
+            obstacle.do_move(engine);
         }
     }
 
-    if state.pill_timer.tick(engine.delta).just_finished() {
-        state.pill_timer = Timer::from_seconds(speed_to_spawn_timeout(2.0, state.speed), false);
+    if state.obstacle_next_timer.tick(engine.delta).just_finished() {
+        state.obstacle_next_timer = Timer::from_seconds(thread_rng().gen_range(2.0..10.0), false);
+        state.obstacles.push(Obstacle::new(engine, state.obstacle_serial));
+        state.obstacle_serial += 1;
+    }
 
+    // Check if it's time to add a pill
+    if state.pill_timer.tick(engine.delta).just_finished() {
         let label = format!("pill{}", state.pill_idx);
         state.pill_idx += 1;
 
@@ -180,51 +352,63 @@ fn game_logic(engine: &mut Engine, state: &mut GameState) {
         pill.collision = true;
     }
 
-    for control in PLAYER_CONTROL {
-        if engine.keyboard_state.just_pressed_any(&control) {
-            let mut handled = false;
-            for player in &mut state.player {
-                if player.loose {
-                    continue;
-                }
-                if control == player.control.as_slice() {
-                    player.direction = new_direction(player.direction, engine.keyboard_state.pressed(control[0]));
-                    handled = true;
-                    break;
-                }
+    // Check if it's time for players to move
+    if state.player_move_timer.tick(engine.delta).just_finished() {
+        state.player_move_timer = Timer::from_seconds(PLAYER_MOVE_TIMER_START, false);
+
+        for (idx, player) in state.player.iter_mut().enumerate() {
+            if ! player.is_playing() {
+                continue;
             }
-            if ! handled {
-                state.player.push(Player::new(state.player.len()));
+
+            let head_old_pos = engine.sprites.get(&player.head_label).unwrap().translation;
+            let head_new_pos = new_position(&engine, head_old_pos, player.direction, PLAYER_MOVE_DISTANCE);
+            let head_sprite = engine.sprites.get_mut(&player.head_label).unwrap();
+            head_sprite.translation = head_new_pos;
+
+            let tail_label = format!("player-tail{}.{}", idx, player.serial);
+            player.serial += 1;
+            let add_tail = engine.add_sprite(tail_label.clone(), player.sprite);
+            add_tail.translation = head_old_pos;
+            add_tail.collision = true;
+            add_tail.scale = PLAYER_SCALE_TAIL;
+            player.labels.push_front(tail_label);
+            if player.labels.len() > player.max_len {
+                engine.sprites.remove(&player.labels.pop_back().unwrap());
             }
         }
     }
 
-    if state.player_move_timer.tick(engine.delta).just_finished() {
-        state.player_move_timer = Timer::from_seconds(PLAYER_MOVE_TIMER_START / state.speed as f32, false);
-
-        for (idx, player) in state.player.iter_mut().enumerate() {
-            if player.loose {
-                continue;
+    // Check for key-presses, includes detecting a new player
+    for player in &mut state.player {
+        if engine.keyboard_state.just_pressed_any(&player.control) {
+            if player.is_playing() {
+                player.direction = new_direction(player.direction, engine.keyboard_state.pressed(player.control[0]));
+            } else if player.is_waiting() {
+                player.activate();
+                let _ = engine.texts.remove(&player.score_label);
+                let head = engine.add_sprite(&player.head_label, player.sprite);
+                head.translation = player.starting_position;
+                head.collision = true;
+                head.scale = PLAYER_SCALE_HEAD;
             }
-            let new_head_label = format!("player{}.{}", idx, player.serial);
-            player.serial += 1;
-            player.head_pos = new_position(&engine, player.head_pos, player.direction);
-            println!("New head: {}, pos: {}", new_head_label, player.head_pos);
+        }
+    }
 
-            // Old head now becomes tail, rescale it
-            if let Some(sprite) = engine.sprites.get_mut(player.labels.front().unwrap()) {
-                sprite.scale = PLAYER_SCALE_TAIL;
-            }
+    for player in state.player.iter_mut() {
+        if ! player.has_lost() {
+            continue;
+        }
 
-            let new_head = engine.add_sprite(new_head_label.clone(), player.sprite);
-            new_head.translation = player.head_pos;
-            new_head.collision = true;
-            new_head.scale = PLAYER_SCALE_HEAD;
-            player.labels.push_front(new_head_label);
-            if player.labels.len() > player.max_len {
-                engine.sprites.remove(&player.labels.pop_back().unwrap());
-                println!("Removing one from tail");
+        if player.loose_timeout.tick(engine.delta).just_finished() {
+            let player_text = engine.add_text(player.score_label.clone(), format!("Player {}: {} points", player.idx, player.labels.len() * 10));
+            player_text.translation = Vec2::new(-x + 100.0 + (player.idx as f32 * 100.0), y - 50.0);
+            player_text.scale = 0.4;
+            engine.sprites.remove(&player.head_label);
+            for label in &player.labels {
+                engine.sprites.remove(label);
             }
+            player.deactivate();
         }
     }
 
@@ -234,27 +418,48 @@ fn game_logic(engine: &mut Engine, state: &mut GameState) {
             continue;
         }
 
-        if event.pair.one_starts_with("player") {
-            let mut player_label;
-            let mut colliding_with_label;
-            if event.pair.0.starts_with("player") {
+        if event.pair.one_starts_with("player-head") {
+            println!("Collision with player: {:?}", event.pair);
+            // Figure out which side is the player and which is what the player collided with
+            let player_label;
+            let colliding_with_label;
+            if event.pair.0.starts_with("player-head") {
                 player_label = event.pair.0;
                 colliding_with_label = event.pair.1;
             } else {
                 player_label = event.pair.1;
                 colliding_with_label = event.pair.0;
             }
-            let player = &mut state.player[(player_label.strip_prefix("player").unwrap().chars().nth(0).unwrap() as u8 - '0' as u8) as usize];
 
+            // Get player object based on label name
+            let player = &mut state.player[(player_label.strip_prefix("player-head").unwrap().chars().nth(0).unwrap() as u8 - '0' as u8) as usize];
+
+            // If pill, then eat it, otherwise loose
             if colliding_with_label.starts_with("pill") {
                 player.max_len += 1;
                 engine.sprites.remove(&colliding_with_label);
                 engine.audio_manager.play_sfx(SfxPreset::Confirmation1, 0.2);
-            }
-
-            if colliding_with_label.starts_with("obstacle") {
-                player.loose = true;
+            } else {
+                player.lost();
                 engine.audio_manager.play_sfx(SfxPreset::Impact1, 0.2);
+                println!("{} lost", player_label);
+            }
+        } else if event.pair.0.starts_with("obstacle") && event.pair.1.starts_with("obstacle") {
+            let mut obstacle1: Option<&mut Obstacle> = Option::None;
+            let mut obstacle2: Option<&mut Obstacle> = Option::None;
+            for obstacle in state.obstacles.iter_mut() {
+                if obstacle.label == event.pair.0 {
+                    obstacle1 = Some(obstacle);
+                } else if obstacle.label == event.pair.1 {
+                    obstacle2 = Some(obstacle);
+                }
+            }
+            if obstacle1.is_some() && obstacle2.is_some() {
+                let this = obstacle1.unwrap();
+                let other = obstacle2.unwrap();
+                let this_sprite = engine.sprites.get(&this.label).unwrap();
+                let other_sprite = engine.sprites.get(&other.label).unwrap();
+                this.bounce(other, this_sprite, other_sprite);
             }
         }
     }
